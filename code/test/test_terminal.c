@@ -45,6 +45,11 @@ typedef struct Mock {
     int nclipreads;
     int last_clip_read;
     strbuf *to_backend;
+    /* Emulate Windows: taking clipboard ownership from ourselves
+     * synchronously notifies us that we lost it (WM_DESTROYCLIPBOARD
+     * from EmptyClipboard), unless the write asked to suppress that. */
+    bool emulate_ownership_loss;
+    bool force_ownership_loss;  /* even if must_deselect is false */
 
     TermWin tw;
     Seat seat;
@@ -96,6 +101,10 @@ static void mock_clip_write(TermWin *win, int clipboard, wchar_t *text,
     /* Touch every attr/colour, so ASan/valgrind catch a short array */
     for (int i = 0; i < len; i++)
         (void)attrs[i], (void)colours[i];
+    if (mk->emulate_ownership_loss &&
+        (must_deselect || mk->force_ownership_loss))
+        term_lost_clipboard_ownership(mk->term, clipboard);
+
     strbuf_clear(mk->clip_text);
     wchar_t *copy = snewn(len + 1, wchar_t);
     memcpy(copy, text, len * sizeof(wchar_t));
@@ -935,6 +944,41 @@ static void test_osc52_multiplexers(Mock *mk)
     IEQUAL(get_termchar(mk->term, 0, 0).chr, CSET_ASCII | 'q');
 }
 
+static void test_osc52_reentrancy(Mock *mk)
+{
+    /*
+     * Regression test: on Windows, the second OSC 52 write (once
+     * PuTTY already owns the clipboard) caused EmptyClipboard() to
+     * send WM_DESTROYCLIPBOARD back to us synchronously, whose handler
+     * re-entered term_out() and consumed the input buffer twice,
+     * failing an assertion in bufchain_consume().
+     */
+    osc52_setup(mk, true, false);
+    mk->term->n_mouse_select_clipboards = 2;
+    mk->term->mouse_select_clipboards[1] = OSC52_CLIPBOARD;
+    mk->emulate_ownership_loss = true;
+
+    for (int force = 0; force < 2; force++) {
+        mk->force_ownership_loss = force;
+        mk->nclipwrites = 0;
+        term_datapl(mk->term, PTRLEN_LITERAL(
+                        "\033[H\033[2J"
+                        "\033]52;c;Zmlyc3Q=\007ab"
+                        "\033]52;c;c2Vjb25k\007cd"
+                        "\033]52;c;!\007ef"));
+        IEQUAL(mk->nclipwrites, 3);
+        SEQUAL(mk->clip_text->s, "");
+        IEQUAL(get_termchar(mk->term, 0, 0).chr, CSET_ASCII | 'a');
+        IEQUAL(get_termchar(mk->term, 3, 0).chr, CSET_ASCII | 'd');
+        IEQUAL(get_termchar(mk->term, 5, 0).chr, CSET_ASCII | 'f');
+        IEQUAL(get_termchar(mk->term, 6, 0).chr,
+               mk->term->basic_erase_char.chr);
+    }
+
+    mk->emulate_ownership_loss = mk->force_ownership_loss = false;
+    mk->term->n_mouse_select_clipboards = 1;
+}
+
 int main(void)
 {
     Mock *mk = mock_new();
@@ -953,6 +997,7 @@ int main(void)
     test_osc52_large(mk);
     test_osc52_read(mk);
     test_osc52_multiplexers(mk);
+    test_osc52_reentrancy(mk);
 
     bool failed = mk->any_test_failed;
     ldisc_free(ldisc);

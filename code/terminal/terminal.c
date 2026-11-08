@@ -3382,8 +3382,16 @@ static void osc52_write(Terminal *term, ptrlen sel, ptrlen data)
         tcs[i] = term->basic_erase_char.truecolour;
     }
 
+    /*
+     * must_deselect is false: we are called from inside term_out(),
+     * and on Windows, replacing clipboard data we already own would
+     * otherwise synchronously deliver WM_DESTROYCLIPBOARD to our own
+     * window and re-enter the terminal via
+     * term_lost_clipboard_ownership(). (This is the same choice
+     * term_request_copy makes.)
+     */
     for (int i = 0; i < nclips; i++)
-        win_clip_write(term->win, clips[i], text, attrs, tcs, len, true);
+        win_clip_write(term->win, clips[i], text, attrs, tcs, len, false);
 
     smemclr(text, (textlen + 1) * sizeof(wchar_t));
     sfree(text);
@@ -6072,7 +6080,12 @@ static void term_out(Terminal *term, bool called_from_term_data)
 /* Wrapper on term_out with the right prototype to be a toplevel callback */
 void term_out_cb(void *ctx)
 {
-    term_out((Terminal *)ctx, false);
+    Terminal *term = (Terminal *)ctx;
+    if (!term->in_term_out) {
+        term->in_term_out = true;
+        term_out(term, false);
+        term->in_term_out = false;
+    }
 }
 
 /*
@@ -8179,8 +8192,18 @@ void term_lost_clipboard_ownership(Terminal *term, int clipboard)
      * Since terminal output is suppressed during drag-selects, we
      * should make sure to write any pending output if one has just
      * finished.
+     *
+     * But not if we got here from inside term_out itself (e.g. a
+     * clipboard write triggered by an escape sequence causing the
+     * platform to report a change of clipboard owner synchronously):
+     * re-entering it would process the same input twice. The outer
+     * call will carry on with the pending output anyway.
      */
-    term_out(term, false);
+    if (!term->in_term_out) {
+        term->in_term_out = true;
+        term_out(term, false);
+        term->in_term_out = false;
+    }
 }
 
 static void term_added_data(Terminal *term, bool called_from_term_data)
